@@ -1,0 +1,11 @@
+menu "iot-sad-zvuk"
+
+    config IOT_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+
+    config IOT_WIFI_PASSWORD
+        string "Wi-Fi пароль"
+        default ""
+
+endmenu
