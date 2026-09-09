@@ -92,6 +92,8 @@ static void i2s_init(void)
 }
 
 // Масштабирование громкости + отправка PCM в I2S
+static int16_t s_last_l, s_last_r; // последний фрейм — для плавного затухания
+
 static void i2s_write_pcm(const uint8_t *pcm, uint32_t len, uint8_t channels)
 {
     // моно растягиваем в стерео, поэтому буфер с запасом x2
@@ -117,17 +119,31 @@ static void i2s_write_pcm(const uint8_t *pcm, uint32_t len, uint8_t channels)
     size_t written = 0;
     ESP_ERROR_CHECK(i2s_channel_write(s_tx_handle, scaled, out_n * sizeof(int16_t),
                                       &written, portMAX_DELAY));
+    if (out_n >= 2) {
+        s_last_l = scaled[out_n - 2];
+        s_last_r = scaled[out_n - 1];
+    }
 }
 
 // После конца воспроизведения заливаем DMA-буфер нулями, иначе I2S
-// продолжает крутить последний фрагмент звука («пек-пек-пек»)
+// продолжает крутить последний фрагмент звука («пек-пек-пек»).
+// Сначала короткий спад от последнего сэмпла к нулю — резкий перепад
+// в тишину слышен как щелчок.
 static void i2s_flush_silence(void)
 {
+    static int16_t ramp[512 * 2]; // ~12 мс затухания
+    for (int i = 0; i < 512; i++) {
+        ramp[i * 2]     = (int16_t)((int32_t)s_last_l * (512 - i) / 512);
+        ramp[i * 2 + 1] = (int16_t)((int32_t)s_last_r * (512 - i) / 512);
+    }
+    size_t written = 0;
+    i2s_channel_write(s_tx_handle, ramp, sizeof(ramp), &written, portMAX_DELAY);
+    s_last_l = s_last_r = 0;
+
     static const uint8_t zeros[PCM_BUF_SIZE];
     size_t total = I2S_DMA_DESCS * I2S_DMA_FRAMES * 4; // весь DMA-буфер канала
     while (total) {
         size_t chunk = total > sizeof(zeros) ? sizeof(zeros) : total;
-        size_t written = 0;
         i2s_channel_write(s_tx_handle, zeros, chunk, &written, portMAX_DELAY);
         total -= written;
     }
@@ -232,7 +248,8 @@ static esp_audio_err_t decode_feed(player_ctx_t *ctx, const uint8_t *data,
         .len = len,
         .eos = eos,
     };
-    while (raw.len) {
+    // do/while: при eos с len=0 нужен один вызов, чтобы декодер выдал хвост
+    do {
         esp_audio_simple_dec_out_t out = {
             .buffer = pcm_buf,
             .len = PCM_BUF_SIZE,
@@ -260,7 +277,7 @@ static esp_audio_err_t decode_feed(player_ctx_t *ctx, const uint8_t *data,
         }
         raw.len -= raw.consumed;
         raw.buffer += raw.consumed;
-    }
+    } while (raw.len);
     return ESP_AUDIO_ERR_OK;
 }
 
@@ -315,6 +332,9 @@ static void play_stream(void)
         if (decode_feed(&ctx, raw_buf, n, false) != ESP_AUDIO_ERR_OK) {
             break;
         }
+    }
+    if (!s_stop_requested) {
+        decode_feed(&ctx, raw_buf, 0, true); // eos: декодер выдаёт последний кадр
     }
     esp_audio_simple_dec_close(ctx.dec);
 }
