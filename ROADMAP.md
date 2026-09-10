@@ -46,9 +46,15 @@
    plain TCP (TLS — к этапу 6). Топики `zvuk/<id>/cmd` (beep / stop /
    `vol N` / `play <url>`) и retained `zvuk/<id>/state` + LWT.
    Device id: `zvuk-XXXXXX` (3 байта MAC). Прошивка ~1.6 МБ.
-5. OTA: таблица разделов с двумя слотами уже введена (`partitions.csv`),
-   осталось добавить `esp_https_ota` + откат и LittleFS. После этого
-   встроенный `sound.mp3` убрать — всё стримится.
+5. OTA через GitHub: таблица разделов с двумя слотами уже введена
+   (`partitions.csv`), но в прошивке OTA **пока нет** — надо добавить
+   `esp_https_ota` + откат (`esp_ota_mark_app_valid_cancel_rollback`)
+   и LittleFS. Схема: GitHub Actions собирает прошивку (ESP-IDF в CI)
+   и публикует бинарь в GitHub Releases по тегу; устройство получает
+   MQTT-команду `ota <url>` (или поллит релизы) и тянет бинарь по HTTPS
+   (crt bundle, releases отдают с github.com — проверить, что редирект
+   на objects.githubusercontent.com проходит с esp_http_client).
+   После этого встроенный `sound.mp3` убрать — всё стримится.
 6. Бэкенд + фронтенд на k8s, привязка устройств, TLS/авторизация
    (MQTT пока на общем логине `device`, без TLS).
    Частично готово (2026-09-10): zvuk-server (Go) + фронт на
@@ -64,6 +70,20 @@
    `stop` выходит из цикла. Во фронте — переключатель «зациклить».
    Нюанс: MP3-стрим с нуля каждый круг → короткая пауза между кругами,
    для бесшовного лупа позже смотреть на кеширование PCM.
+9. CI/CD — деплой по коммиту (GitHub Actions):
+   - `iot-sad-zvuk` (push в `server/`): docker build → push в registry
+     кластера (`5.183.191.188:32000`) → `kubectl apply` манифестов +
+     rollout restart. Реестр сейчас insecure (plain HTTP) — из GH Actions
+     надо либо поднять ingress/TLS на registry, либо пушить через SSH-туннель
+     на worker, либо переехать на GHCR + imagePullSecret.
+   - kubectl-доступ из CI: scoped kubeconfig через
+     `task new-client NAME=iot-sad-zvuk` в devdima-k8s (уже есть схема,
+     clients/), положить в GitHub Secrets как `KUBECONFIG_B64`.
+   - Манифесты живут в devdima-k8s → либо workflow там (тогда сборка
+     образа триггерится repository_dispatch'ем из iot-sad-zvuk), либо
+     перенести манифесты приложения в iot-sad-zvuk/deploy/ (broker и
+     инфра остаются в devdima-k8s). Решить на этапе реализации.
+   - Сборка прошивки в CI — часть этапа 5 (OTA).
 
 ## Известные проблемы
 
