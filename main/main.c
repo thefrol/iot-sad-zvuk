@@ -19,6 +19,10 @@
 #include "esp_http_client.h"
 #include "mqtt_client.h"
 #include "esp_mac.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+
+#include "ota_update.h"
 
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
@@ -612,6 +616,63 @@ static esp_err_t stop_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static const char *ota_state_str(ota_state_t s)
+{
+    switch (s) {
+    case OTA_STATE_CHECKING:         return "checking";
+    case OTA_STATE_UPDATE_AVAILABLE: return "update_available";
+    case OTA_STATE_DOWNLOADING:      return "downloading";
+    case OTA_STATE_REBOOT_PENDING:   return "reboot_pending";
+    case OTA_STATE_UP_TO_DATE:       return "up_to_date";
+    case OTA_STATE_ERROR:            return "error";
+    default:                         return "idle";
+    }
+}
+
+// GET /ota — состояние OTA (версия, доступное обновление, последняя ошибка)
+static esp_err_t ota_status_handler(httpd_req_t *req)
+{
+    ota_status_t st = {0};
+    ota_update_get_status(&st);
+    char resp[384];
+    snprintf(resp, sizeof(resp),
+             "{\"state\":\"%s\",\"current\":\"%s\",\"available\":\"%s\",\"error\":\"%s\"}\n",
+             ota_state_str(st.state), st.current_version, st.available_version,
+             st.error_message);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
+}
+
+// POST /ota — принудительно проверить релиз; если есть новее — скачать и
+// перезагрузиться. Проверка синхронная, ответ приходит через пару секунд.
+static esp_err_t ota_update_handler(httpd_req_t *req)
+{
+    ota_update_check_now();
+    ota_status_t st = {0};
+    ota_update_get_status(&st);
+    if (st.state == OTA_STATE_UPDATE_AVAILABLE) {
+        if (ota_update_start_download() == ESP_OK) {
+            char resp[128];
+            snprintf(resp, sizeof(resp), "скачиваю %s, устройство перезагрузится\n",
+                     st.available_version);
+            httpd_resp_sendstr(req, resp);
+        } else {
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_sendstr(req, "OTA уже выполняется\n");
+        }
+        return ESP_OK;
+    }
+    if (st.state == OTA_STATE_UP_TO_DATE) {
+        httpd_resp_sendstr(req, "версия актуальна\n");
+        return ESP_OK;
+    }
+    httpd_resp_set_status(req, "502 Bad Gateway");
+    httpd_resp_sendstr(req, st.error_message[0] ? st.error_message
+                                                : "не удалось проверить обновления\n");
+    return ESP_OK;
+}
+
 static esp_err_t root_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
@@ -621,6 +682,8 @@ static esp_err_t root_handler(httpd_req_t *req)
         "  POST /play?url=.. — проиграть MP3 по URL (устройство само скачивает)\n"
         "  GET  /beep        — проиграть встроенный звук\n"
         "  POST /stop        — остановить воспроизведение\n"
+        "  GET  /ota         — статус OTA (JSON)\n"
+        "  POST /ota         — проверить релиз и обновиться, если есть новее\n"
         "  ?vol=0..255       — громкость (параметр /play и /beep)\n");
     return ESP_OK;
 }
@@ -628,7 +691,8 @@ static esp_err_t root_handler(httpd_req_t *req)
 static void http_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 6 * 1024; // хендлер только кладёт данные в буфер
+    // 8 КБ: POST /ota прямо в задаче httpd делает TLS-запрос к GitHub API
+    config.stack_size = 8 * 1024;
     config.max_uri_handlers = 8;
     config.recv_wait_timeout = 15;
 
@@ -639,10 +703,14 @@ static void http_server_start(void)
     const httpd_uri_t play = { .uri = "/play", .method = HTTP_POST, .handler = play_handler };
     const httpd_uri_t beep = { .uri = "/beep", .method = HTTP_GET,  .handler = beep_handler };
     const httpd_uri_t stop = { .uri = "/stop", .method = HTTP_POST, .handler = stop_handler };
+    const httpd_uri_t ota_status = { .uri = "/ota", .method = HTTP_GET,  .handler = ota_status_handler };
+    const httpd_uri_t ota_update = { .uri = "/ota", .method = HTTP_POST, .handler = ota_update_handler };
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &play));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &beep));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &stop));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_status));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(server, &ota_update));
     ESP_LOGI(TAG, "HTTP-сервер запущен на порту %d", config.server_port);
 }
 
@@ -657,10 +725,11 @@ static void mqtt_publish_state(void)
     if (!s_mqtt_client || !s_mqtt_connected) {
         return;
     }
-    char payload[160];
+    char payload[192];
     snprintf(payload, sizeof(payload),
-             "{\"online\":true,\"id\":\"%s\",\"ip\":\"%s\",\"playing\":%s,\"volume\":%u}",
-             s_device_id, s_ip_str, s_is_playing ? "true" : "false", s_volume);
+             "{\"online\":true,\"id\":\"%s\",\"ip\":\"%s\",\"playing\":%s,\"volume\":%u,\"fw\":\"%s\"}",
+             s_device_id, s_ip_str, s_is_playing ? "true" : "false", s_volume,
+             esp_app_get_description()->version);
     esp_mqtt_client_publish(s_mqtt_client, s_state_topic, payload, 0, 0, 1);
 }
 
@@ -695,6 +764,22 @@ static void mqtt_handle_command(char *cmd)
         default:
             break;
         }
+    } else if (strcmp(cmd, "ota") == 0) {
+        // Принудительно: проверить релиз и обновиться, если есть новее
+        ota_update_check_now();
+        ota_status_t st = {0};
+        ota_update_get_status(&st);
+        if (st.state == OTA_STATE_UPDATE_AVAILABLE) {
+            ESP_LOGI(TAG, "ota: скачиваю %s", st.available_version);
+            ota_update_start_download();
+        } else if (st.state == OTA_STATE_UP_TO_DATE) {
+            ESP_LOGI(TAG, "ota: версия актуальна (%s)", st.current_version);
+        } else {
+            ESP_LOGW(TAG, "ota: проверка не удалась: %s", st.error_message);
+        }
+    } else if (strcmp(cmd, "ota check") == 0) {
+        // Только проверить, не скачивать
+        ota_update_check_now();
     } else {
         ESP_LOGW(TAG, "Неизвестная команда: %s", cmd);
     }
@@ -830,5 +915,14 @@ void app_main(void)
     }
     xEventGroupWaitBits(s_wifi_events, WIFI_GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
     mqtt_start();
+
+#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    // Прошивка дошла до сети — подтверждаем её, иначе загрузчик откатит слот
+    ESP_ERROR_CHECK(esp_ota_mark_app_valid_cancel_rollback());
+#endif
+    // OTA только в режиме station (в AP-режиме интернета нет)
+    if (strlen(CONFIG_IOT_WIFI_SSID) > 0 && strlen(CONFIG_ZVUK_OTA_REPO) > 0) {
+        ota_update_start();
+    }
     ESP_LOGI(TAG, "Готово. Пример: curl -X POST --data-binary @sound.mp3 http://<IP>/play");
 }

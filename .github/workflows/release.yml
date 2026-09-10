@@ -1,0 +1,67 @@
+# Сборка прошивки и публикация релиза с бинарником.
+# Устройства опрашивают releases/latest и забирают ассет под свой чип
+# (см. main/ota_update.c). Запуск — пуш тега v*:
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# Нужные GitHub Secrets (зашиваются в бинарь, без них устройство после OTA
+# потеряет сеть/брокер): WIFI_SSID, WIFI_PASSWORD,
+# MQTT_URI, MQTT_USERNAME, MQTT_PASSWORD.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Сборка esp32c3
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.0.2
+    steps:
+      - uses: actions/checkout@v4
+
+      # В контейнере idf работаем под root, git ругается на чужой каталог
+      - name: git safe.directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Креды из секретов репозитория
+        run: |
+          {
+            echo "CONFIG_IOT_WIFI_SSID=\"${{ secrets.WIFI_SSID }}\""
+            echo "CONFIG_IOT_WIFI_PASSWORD=\"${{ secrets.WIFI_PASSWORD }}\""
+            echo "CONFIG_IOT_MQTT_URI=\"${{ secrets.MQTT_URI }}\""
+            echo "CONFIG_IOT_MQTT_USERNAME=\"${{ secrets.MQTT_USERNAME }}\""
+            echo "CONFIG_IOT_MQTT_PASSWORD=\"${{ secrets.MQTT_PASSWORD }}\""
+          } > sdkconfig.defaults.local
+
+      - name: Сборка прошивки
+        run: |
+          # GitHub перебивает entrypoint контейнера — активируем IDF вручную
+          . "$IDF_PATH/export.sh" >/dev/null 2>&1
+          idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.local" set-target esp32c3
+          idf.py -DPROJECT_VER="${GITHUB_REF_NAME#v}" build
+          cp build/iot-sad-zvuk.bin build/iot-sad-zvuk-esp32c3.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fw-esp32c3
+          path: build/iot-sad-zvuk-esp32c3.bin
+          retention-days: 7
+
+  release:
+    name: Публикация релиза
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fw-*
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: iot-sad-zvuk-*.bin
+          generate_release_notes: true

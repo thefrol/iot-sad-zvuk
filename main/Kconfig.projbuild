@@ -20,4 +20,13 @@ menu "iot-sad-zvuk"
         string "MQTT пароль"
         default ""
 
+    config ZVUK_OTA_REPO
+        string "GitHub-репозиторий для OTA (owner/repo, пусто = OTA выключен)"
+        default "thefrol/iot-sad-zvuk"
+
+    config ZVUK_OTA_CHECK_INTERVAL_MIN
+        int "Интервал проверки обновлений, минут"
+        default 60
+        range 1 1440
+
 endmenu

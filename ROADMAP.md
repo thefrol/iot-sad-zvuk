@@ -46,15 +46,14 @@
    plain TCP (TLS — к этапу 6). Топики `zvuk/<id>/cmd` (beep / stop /
    `vol N` / `play <url>`) и retained `zvuk/<id>/state` + LWT.
    Device id: `zvuk-XXXXXX` (3 байта MAC). Прошивка ~1.6 МБ.
-5. OTA через GitHub: таблица разделов с двумя слотами уже введена
-   (`partitions.csv`), но в прошивке OTA **пока нет** — надо добавить
-   `esp_https_ota` + откат (`esp_ota_mark_app_valid_cancel_rollback`)
-   и LittleFS. Схема: GitHub Actions собирает прошивку (ESP-IDF в CI)
-   и публикует бинарь в GitHub Releases по тегу; устройство получает
-   MQTT-команду `ota <url>` (или поллит релизы) и тянет бинарь по HTTPS
-   (crt bundle, releases отдают с github.com — проверить, что редирект
-   на objects.githubusercontent.com проходит с esp_http_client).
-   После этого встроенный `sound.mp3` убрать — всё стримится.
+5. ~~OTA через GitHub~~ — готово (2026-09-10): `esp_https_ota` + откат
+   (`esp_ota_mark_app_valid_cancel_rollback` после получения IP), фоновая
+   проверка `releases/latest` раз в час, ручной триггер `POST /ota` и
+   MQTT-команды `ota` / `ota check`. CI (`.github/workflows/release.yml`)
+   по тегу `v*` собирает прошивку в контейнере `espressif/idf:v6.0.2` и
+   публикует релиз с `iot-sad-zvuk-esp32c3.bin`; версия = тег
+   (`-DPROJECT_VER`). Креды в CI — Secrets WIFI_SSID/WIFI_PASSWORD/MQTT_*.
+   LittleFS пока не добавлен — встроенный `sound.mp3` остаётся.
 6. Бэкенд + фронтенд на k8s, привязка устройств, TLS/авторизация
    (MQTT пока на общем логине `device`, без TLS).
    Частично готово (2026-09-10): zvuk-server (Go) + фронт на

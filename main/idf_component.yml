@@ -16,3 +16,5 @@ dependencies:
   #   public: true
   espressif/esp_audio_codec: '*'
   espressif/mqtt: "^1.0.0"
+  # В ESP-IDF v6 компонент json (cJSON) вынесен из ядра в реестр компонентов
+  espressif/cjson: "^1.7.18"

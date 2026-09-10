@@ -3,8 +3,8 @@
 IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук через I2S-усилитель MAX98357A
 и 3W динамик. Устройство поднимает Wi-Fi station + HTTP-сервер и играет MP3,
 присланный в теле `POST /play` или лежащий по URL (стримится прямо в декодер,
-локально не хранится). Управление по MQTT (команды/статус). Дальше (TLS, OTA,
-серверная часть) — в `ROADMAP.md`. Флеш 4 МБ.
+локально не хранится). Управление по MQTT (команды/статус), OTA-обновление
+с GitHub Releases. Дальше (TLS, серверная часть) — в `ROADMAP.md`. Флеш 4 МБ.
 
 ## Железо
 
@@ -59,8 +59,9 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
   `_PASSWORD` (пустой URI = MQTT не стартует). Стартует после получения IP.
   Device id = `zvuk-XXXXXX` (последние 3 байта MAC). Топики: подписка
   `zvuk/<id>/cmd` (QoS 1), retained-стейт `zvuk/<id>/state`
-  (`{"online","id","ip","playing","volume"}`, LWT = `{"online":false}`).
-  Команды plain-text: `beep`, `stop`, `vol <0-255>`, `play <url>`;
+  (`{"online","id","ip","playing","volume","fw"}`, LWT = `{"online":false}`).
+  Команды plain-text: `beep`, `stop`, `vol <0-255>`, `play <url>`,
+  `ota` (проверить релиз и обновиться), `ota check` (только проверить);
   неизвестные логируются и игнорируются. Команды исполняет задача `mqtt_cmd`
   (8 КБ стека — внутри бывает esp_http_client), но `stop` обрабатывается
   прямо в хендлере MQTT-событий, иначе не прервать воспроизведение, пока
@@ -74,7 +75,29 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
     `stream_session_run`, источники: `httpd_body_read` / `http_url_read`)
   - `GET /beep` — встроенный звук один раз
   - `POST /stop` — остановить
+  - `GET /ota` — статус OTA (JSON: state/current/available/error)
+  - `POST /ota` — принудительно проверить релиз и обновиться, если есть
+    новее (проверка синхронная, идёт в задаче httpd — стек поднят до 8 КБ
+    из-за TLS-рукопожатия)
   - `?vol=0..255` — громкость (параметр `/play` и `/beep`, дефолт 64)
+- OTA с GitHub Releases (`main/ota_update.c`, схема перенесена из
+  ebbflow-lamp): раз в час (`CONFIG_ZVUK_OTA_CHECK_INTERVAL_MIN`) опрашивает
+  `api.github.com/repos/<CONFIG_ZVUK_OTA_REPO>/releases/latest`, сравнивает
+  semver-тег со своей версией и при наличии новой тянет ассет
+  `iot-sad-zvuk-<chip>.bin` через `esp_https_ota` (cert bundle) и ребутится.
+  Критично: буферы esp_http_client 2048 байт (редиректный URL GitHub
+  ~900+ байт не влезает в дефолтные 512), у GitHub API обязателен заголовок
+  User-Agent, rate limit 60 запр/час на IP — отсюда интервал 60 мин.
+  Откат: `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, самотест —
+  `esp_ota_mark_app_valid_cancel_rollback()` в `app_main` после получения IP.
+- Релиз — тегом: `git tag vX.Y.Z && git push origin vX.Y.Z` → CI
+  (`.github/workflows/release.yml`, контейнер `espressif/idf:v6.0.2`) собирает
+  прошивку и публикует релиз с `iot-sad-zvuk-esp32c3.bin`. Версия прошивки =
+  тег (CI передаёт `-DPROJECT_VER`); не забывать поднимать
+  `project(... VERSION x.y.z)` в корневом `CMakeLists.txt` под новый тег.
+  Креды для CI-сборки — GitHub Secrets: `WIFI_SSID`, `WIFI_PASSWORD`,
+  `MQTT_URI`, `MQTT_USERNAME`, `MQTT_PASSWORD` (зашиваются в бинарь, без них
+  устройство после OTA потеряет сеть/брокер).
 - Параллельное воспроизведение запрещено мьютексом (`409 Conflict`).
 - Оптимизация компилятора — `-O2` (`CONFIG_COMPILER_OPTIMIZATION_PERF`):
   на `-Og` декодер едва поспевает за реальным временем при активном Wi-Fi.
@@ -149,22 +172,27 @@ BCLK ~1.5–1.7V (меандр 1.4 МГц), LRC ~1.5–1.7V, DIN ~0.5–1.6V. Н
 ## Следующие шаги
 
 Полная дорожная карта — в `ROADMAP.md`. Ближайшее:
-- OTA (`esp_https_ota` + откат; `partitions.csv` с двумя слотами уже есть,
-  добавить LittleFS), после OTA встроенный `sound.mp3` убрать
 - TLS для MQTT (сейчас plain TCP — домашняя демка) и HTTPS для `play <url>`
+- LittleFS-раздел (запасной звук при потере сети), потом убрать встроенный
+  `sound.mp3`
 - Бэкенд/фронтенд на k8s (реестр устройств, раздача аудио)
 - Мут по сети: SD-пин усилителя можно посадить на GPIO
 
 ## Структура
 
 - `main/main.c` — вся прошивка: I2S init, Wi-Fi station, HTTP API
-  (`/play` в т.ч. `?url=`), MQTT control-plane, декодер
-- `main/Kconfig.projbuild` — Wi-Fi кредешелы и MQTT URI/логин/пароль
-  (menuconfig → iot-sad-zvuk)
+  (`/play` в т.ч. `?url=`, `/ota`), MQTT control-plane, декодер
+- `main/ota_update.c` — OTA: фоновая проверка GitHub Releases, скачивание
+  через `esp_https_ota`, ручной триггер (`ota_update_check_now` /
+  `ota_update_start_download`)
+- `main/Kconfig.projbuild` — Wi-Fi кредешелы, MQTT URI/логин/пароль,
+  OTA-репозиторий и интервал проверки (menuconfig → iot-sad-zvuk)
 - `main/sound.mp3` — встроенный звук для `/beep` (вшивается во флеш)
 - `main/idf_component.yml` — зависимости `espressif/esp_audio_codec`,
-  `espressif/mqtt`
-- `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.6 МБ с Wi-Fi и MQTT);
-  места под LittleFS пока нет — добавить на этапе OTA
-- `ROADMAP.md` — целевая архитектура и план (TLS, OTA, сервер)
+  `espressif/mqtt`, `espressif/cjson` (в IDF 6 cJSON вынесен из ядра)
+- `.github/workflows/release.yml` — CI: сборка прошивки по тегу `v*` и
+  публикация GitHub Release с бинарником
+- `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.9 МБ с TLS и OTA);
+  места под LittleFS пока нет
+- `ROADMAP.md` — целевая архитектура и план (TLS, сервер)
 - `managed_components/` — скачанные компоненты (в .gitignore)
