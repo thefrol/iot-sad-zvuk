@@ -16,6 +16,9 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "mqtt_client.h"
+#include "esp_mac.h"
 
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
@@ -64,6 +67,19 @@ static SemaphoreHandle_t s_done_sem;      // плеер закончил сес�
 static QueueHandle_t s_job_queue;         // задания плееру (JOB_*)
 static StreamBufferHandle_t s_stream_buf; // сырые данные из сети
 static volatile bool s_stream_done;       // тело запроса принято целиком
+
+// --- MQTT control-plane ---
+static esp_mqtt_client_handle_t s_mqtt_client;
+static volatile bool s_mqtt_connected;
+static char s_device_id[16];   // "zvuk-a1b2c3" — последние 3 байта MAC
+static char s_cmd_topic[48];   // "zvuk/<id>/cmd"
+static char s_state_topic[48]; // "zvuk/<id>/state"
+static char s_ip_str[16] = "0.0.0.0";
+static volatile bool s_is_playing;
+static QueueHandle_t s_cmd_queue; // команды из MQTT -> mqtt_cmd_task
+#define MQTT_CMD_MAX 256
+
+static void mqtt_publish_state(void);
 
 static void i2s_init(void)
 {
@@ -164,6 +180,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&e->ip_info.ip));
         xEventGroupSetBits(s_wifi_events, WIFI_GOT_IP_BIT);
     }
 }
@@ -356,6 +373,142 @@ static void player_task(void *arg)
     }
 }
 
+// --- Сессии воспроизведения (общий код для HTTP и MQTT) ---
+
+// Читатель данных для стрим-сессии: >0 байт, 0 = конец данных, <0 = ошибка
+typedef int (*stream_read_fn)(void *ctx, uint8_t *buf, size_t cap);
+
+// Каркас стрим-сессии: занимает мьютекс, перекладывает данные от read_fn
+// в кольцевой буфер, ждёт, пока плеер доиграет. false = уже играем (busy).
+static bool stream_session_run(stream_read_fn read_fn, void *ctx, bool *was_stopped)
+{
+    if (xSemaphoreTake(s_session_mutex, 0) != pdTRUE) {
+        return false;
+    }
+    s_stop_requested = false;
+    s_stream_done = false;
+    xStreamBufferReset(s_stream_buf);
+    s_is_playing = true;
+    mqtt_publish_state();
+
+    int job = JOB_STREAM;
+    xQueueSend(s_job_queue, &job, 0);
+
+    static uint8_t net_buf[RAW_CHUNK];
+    while (!s_stop_requested) {
+        int n = read_fn(ctx, net_buf, RAW_CHUNK);
+        if (n <= 0) {
+            break; // 0 = данные закончились, <0 = ошибка
+        }
+        size_t sent = 0;
+        while (sent < (size_t)n && !s_stop_requested) {
+            sent += xStreamBufferSend(s_stream_buf, net_buf + sent, n - sent,
+                                      pdMS_TO_TICKS(200));
+        }
+    }
+    s_stream_done = true;
+
+    // ждём, пока плеер доиграет буфер
+    xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(60000));
+    xSemaphoreGive(s_session_mutex);
+    s_is_playing = false;
+    mqtt_publish_state();
+    if (was_stopped) {
+        *was_stopped = s_stop_requested;
+    }
+    return true;
+}
+
+// Встроенный звук один раз. false = уже играем (busy).
+static bool beep_run(bool *was_stopped)
+{
+    if (xSemaphoreTake(s_session_mutex, 0) != pdTRUE) {
+        return false;
+    }
+    s_stop_requested = false;
+    s_is_playing = true;
+    mqtt_publish_state();
+
+    int job = JOB_EMBEDDED;
+    xQueueSend(s_job_queue, &job, 0);
+    xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(30000));
+    xSemaphoreGive(s_session_mutex);
+    s_is_playing = false;
+    mqtt_publish_state();
+    if (was_stopped) {
+        *was_stopped = s_stop_requested;
+    }
+    return true;
+}
+
+// Чтение тела HTTP-запроса (POST /play) как источника стрима
+typedef struct {
+    httpd_req_t *req;
+} httpd_body_ctx_t;
+
+static int httpd_body_read(void *vctx, uint8_t *buf, size_t cap)
+{
+    httpd_body_ctx_t *ctx = vctx;
+    int n;
+    do {
+        n = httpd_req_recv(ctx->req, (char *)buf, cap);
+    } while (n == HTTPD_SOCK_ERR_TIMEOUT && !s_stop_requested);
+    // клиент медленно шлёт — ждём; n==0 = тело закончилось, <0 = ошибка сокета
+    return n == HTTPD_SOCK_ERR_TIMEOUT ? 0 : n;
+}
+
+// Загрузка MP3 по URL (команда `play <url>`, POST /play?url=...)
+typedef enum {
+    PLAY_URL_OK,
+    PLAY_URL_BUSY,
+    PLAY_URL_FETCH_ERR,
+} play_url_result_t;
+
+typedef struct {
+    esp_http_client_handle_t client;
+} http_url_ctx_t;
+
+static int http_url_read(void *vctx, uint8_t *buf, size_t cap)
+{
+    http_url_ctx_t *ctx = vctx;
+    return esp_http_client_read(ctx->client, (char *)buf, cap);
+}
+
+static play_url_result_t play_url(const char *url, bool *was_stopped)
+{
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 5000,
+        .buffer_size = RAW_CHUNK,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "play url: не удалось создать http-клиент");
+        return PLAY_URL_FETCH_ERR;
+    }
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "play url: не удалось подключиться к %s: %s",
+                 url, esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return PLAY_URL_FETCH_ERR;
+    }
+    esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGE(TAG, "play url: HTTP %d от %s", status, url);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return PLAY_URL_FETCH_ERR;
+    }
+    ESP_LOGI(TAG, "play url: стримлю %s", url);
+    http_url_ctx_t ctx = { .client = client };
+    bool started = stream_session_run(http_url_read, &ctx, was_stopped);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return started ? PLAY_URL_OK : PLAY_URL_BUSY;
+}
+
 // --- HTTP API ---
 
 static void apply_volume_query(httpd_req_t *req)
@@ -370,8 +523,35 @@ static void apply_volume_query(httpd_req_t *req)
         if (v >= 0 && v <= 255) {
             s_volume = (uint8_t)v;
             ESP_LOGI(TAG, "Громкость: %d", v);
+            mqtt_publish_state();
         }
     }
+}
+
+// Процент-декодирование значения query-параметра на месте (+ -> пробел)
+static int hex_val(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void url_decode_in_place(char *s)
+{
+    char *dst = s;
+    while (*s) {
+        int hi = s[0] == '%' ? hex_val(s[1]) : -1;
+        int lo = hi >= 0 ? hex_val(s[2]) : -1;
+        if (hi >= 0 && lo >= 0) {
+            *dst++ = (char)((hi << 4) | lo);
+            s += 3;
+        } else {
+            *dst++ = *s == '+' ? ' ' : *s;
+            s++;
+        }
+    }
+    *dst = '\0';
 }
 
 static esp_err_t reply_busy(httpd_req_t *req)
@@ -381,61 +561,47 @@ static esp_err_t reply_busy(httpd_req_t *req)
     return ESP_OK;
 }
 
-// POST /play — тело запроса это MP3-поток: принимаем в кольцевой буфер,
-// декодирует и играет player_task. Ответ уходит по окончании воспроизведения.
+// POST /play — тело запроса это MP3-поток, либо ?url=... — тогда устройство
+// само забирает MP3 по HTTP. Ответ уходит по окончании воспроизведения.
 static esp_err_t play_handler(httpd_req_t *req)
 {
-    if (xSemaphoreTake(s_session_mutex, 0) != pdTRUE) {
-        return reply_busy(req);
-    }
-    s_stop_requested = false;
-    s_stream_done = false;
-    xStreamBufferReset(s_stream_buf);
     apply_volume_query(req);
 
-    int job = JOB_STREAM;
-    xQueueSend(s_job_queue, &job, 0);
-
-    static uint8_t net_buf[RAW_CHUNK];
-    while (!s_stop_requested) {
-        int n = httpd_req_recv(req, (char *)net_buf, RAW_CHUNK);
-        if (n <= 0) {
-            if (n == HTTPD_SOCK_ERR_TIMEOUT) {
-                continue; // клиент медленно шлёт — ждём
+    char query[400];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char url[352];
+        if (httpd_query_key_value(query, "url", url, sizeof(url)) == ESP_OK) {
+            url_decode_in_place(url);
+            bool stopped = false;
+            play_url_result_t r = play_url(url, &stopped);
+            if (r == PLAY_URL_BUSY) {
+                return reply_busy(req);
             }
-            break; // 0 = тело закончилось, <0 = ошибка сокета
-        }
-        size_t sent = 0;
-        while (sent < (size_t)n && !s_stop_requested) {
-            sent += xStreamBufferSend(s_stream_buf, net_buf + sent, n - sent,
-                                      pdMS_TO_TICKS(200));
+            httpd_resp_sendstr(req, r == PLAY_URL_FETCH_ERR ? "не удалось скачать url\n"
+                                       : stopped            ? "остановлено\n"
+                                                            : "ok\n");
+            return ESP_OK;
         }
     }
-    s_stream_done = true;
 
-    // ждём, пока плеер доиграет буфер
-    xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(60000));
-    xSemaphoreGive(s_session_mutex);
-
-    httpd_resp_sendstr(req, s_stop_requested ? "остановлено\n" : "ok\n");
+    httpd_body_ctx_t ctx = { .req = req };
+    bool stopped = false;
+    if (!stream_session_run(httpd_body_read, &ctx, &stopped)) {
+        return reply_busy(req);
+    }
+    httpd_resp_sendstr(req, stopped ? "остановлено\n" : "ok\n");
     return ESP_OK;
 }
 
 // GET /beep — встроенный звук один раз (проверка связи/железа)
 static esp_err_t beep_handler(httpd_req_t *req)
 {
-    if (xSemaphoreTake(s_session_mutex, 0) != pdTRUE) {
+    apply_volume_query(req);
+    bool stopped = false;
+    if (!beep_run(&stopped)) {
         return reply_busy(req);
     }
-    s_stop_requested = false;
-    apply_volume_query(req);
-
-    int job = JOB_EMBEDDED;
-    xQueueSend(s_job_queue, &job, 0);
-    xSemaphoreTake(s_done_sem, pdMS_TO_TICKS(30000));
-    xSemaphoreGive(s_session_mutex);
-
-    httpd_resp_sendstr(req, s_stop_requested ? "остановлено\n" : "ok\n");
+    httpd_resp_sendstr(req, stopped ? "остановлено\n" : "ok\n");
     return ESP_OK;
 }
 
@@ -451,10 +617,11 @@ static esp_err_t root_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/plain; charset=utf-8");
     httpd_resp_sendstr(req,
         "iot-sad-zvuk\n"
-        "  POST /play   — проиграть MP3 из тела запроса: curl -X POST --data-binary @f.mp3 http://IP/play\n"
-        "  GET  /beep   — проиграть встроенный звук\n"
-        "  POST /stop   — остановить воспроизведение\n"
-        "  ?vol=0..255  — громкость (параметр /play и /beep)\n");
+        "  POST /play        — проиграть MP3 из тела запроса: curl -X POST --data-binary @f.mp3 http://IP/play\n"
+        "  POST /play?url=.. — проиграть MP3 по URL (устройство само скачивает)\n"
+        "  GET  /beep        — проиграть встроенный звук\n"
+        "  POST /stop        — остановить воспроизведение\n"
+        "  ?vol=0..255       — громкость (параметр /play и /beep)\n");
     return ESP_OK;
 }
 
@@ -477,6 +644,163 @@ static void http_server_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &beep));
     ESP_ERROR_CHECK(httpd_register_uri_handler(server, &stop));
     ESP_LOGI(TAG, "HTTP-сервер запущен на порту %d", config.server_port);
+}
+
+// --- MQTT control-plane ---
+
+// Retained-состояние устройства; публикуется при коннекте и смене
+// playing/volume. Вызывать можно из любой задачи — publish потокобезопасен.
+// QoS 0 нарочно: на плохом линке ретрансляции QoS 1 приходят на брокер
+// с опозданием и затирают retained-стейт устаревшим значением.
+static void mqtt_publish_state(void)
+{
+    if (!s_mqtt_client || !s_mqtt_connected) {
+        return;
+    }
+    char payload[160];
+    snprintf(payload, sizeof(payload),
+             "{\"online\":true,\"id\":\"%s\",\"ip\":\"%s\",\"playing\":%s,\"volume\":%u}",
+             s_device_id, s_ip_str, s_is_playing ? "true" : "false", s_volume);
+    esp_mqtt_client_publish(s_mqtt_client, s_state_topic, payload, 0, 0, 1);
+}
+
+static void mqtt_handle_command(char *cmd)
+{
+    ESP_LOGI(TAG, "MQTT команда: %s", cmd);
+    if (strcmp(cmd, "beep") == 0) {
+        if (!beep_run(NULL)) {
+            ESP_LOGW(TAG, "beep: занято, уже играю");
+        }
+    } else if (strncmp(cmd, "vol ", 4) == 0) {
+        int v = atoi(cmd + 4);
+        if (v >= 0 && v <= 255) {
+            s_volume = (uint8_t)v;
+            ESP_LOGI(TAG, "Громкость: %d", v);
+            mqtt_publish_state();
+        } else {
+            ESP_LOGW(TAG, "vol: значение вне 0..255: %s", cmd + 4);
+        }
+    } else if (strncmp(cmd, "play ", 5) == 0) {
+        const char *url = cmd + 5;
+        while (*url == ' ') {
+            url++;
+        }
+        switch (play_url(url, NULL)) {
+        case PLAY_URL_BUSY:
+            ESP_LOGW(TAG, "play: занято, уже играю");
+            break;
+        case PLAY_URL_FETCH_ERR:
+            ESP_LOGW(TAG, "play: не удалось скачать %s", url);
+            break;
+        default:
+            break;
+        }
+    } else {
+        ESP_LOGW(TAG, "Неизвестная команда: %s", cmd);
+    }
+}
+
+// Команды исполняются в отдельной задаче, чтобы не блокировать mqtt_task:
+// play/beep длятся секунды. `stop` обрабатывается прямо в хендлере событий.
+static void mqtt_cmd_task(void *arg)
+{
+    static char cmd[MQTT_CMD_MAX];
+    while (1) {
+        if (xQueueReceive(s_cmd_queue, cmd, portMAX_DELAY) == pdTRUE) {
+            mqtt_handle_command(cmd);
+        }
+    }
+}
+
+static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    esp_mqtt_event_handle_t event = data;
+    switch ((esp_mqtt_event_id_t)id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT подключён, device id %s", s_device_id);
+        s_mqtt_connected = true;
+        esp_mqtt_client_subscribe(s_mqtt_client, s_cmd_topic, 1);
+        mqtt_publish_state();
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT отключён");
+        s_mqtt_connected = false;
+        break;
+    case MQTT_EVENT_DATA: {
+        if (event->topic_len != strlen(s_cmd_topic) ||
+            strncmp(event->topic, s_cmd_topic, event->topic_len) != 0) {
+            break;
+        }
+        // команды короткие, дробление пакета на части не поддерживаем
+        if (event->current_data_offset != 0 ||
+            event->data_len != event->total_data_len ||
+            event->data_len >= MQTT_CMD_MAX) {
+            ESP_LOGW(TAG, "MQTT: слишком длинная команда (%d байт), игнор",
+                     event->total_data_len);
+            break;
+        }
+        // stop — сразу: mqtt_cmd_task может быть занята воспроизведением
+        if (event->data_len == 4 && strncmp(event->data, "stop", 4) == 0) {
+            ESP_LOGI(TAG, "MQTT команда: stop");
+            s_stop_requested = true;
+            break;
+        }
+        char cmd[MQTT_CMD_MAX];
+        memcpy(cmd, event->data, event->data_len);
+        int len = event->data_len;
+        while (len > 0 && (cmd[len - 1] == ' ' || cmd[len - 1] == '\n' ||
+                           cmd[len - 1] == '\r' || cmd[len - 1] == '\t')) {
+            len--;
+        }
+        cmd[len] = '\0';
+        if (xQueueSend(s_cmd_queue, cmd, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Очередь команд полна, команда потеряна: %s", cmd);
+        }
+        break;
+    }
+    case MQTT_EVENT_ERROR:
+        ESP_LOGW(TAG, "MQTT ошибка, тип %d", event->error_handle->error_type);
+        break;
+    default:
+        break;
+    }
+}
+
+static void mqtt_start(void)
+{
+    if (strlen(CONFIG_IOT_MQTT_URI) == 0) {
+        ESP_LOGI(TAG, "MQTT выключен (пустой IOT_MQTT_URI)");
+        return;
+    }
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(s_device_id, sizeof(s_device_id), "zvuk-%02x%02x%02x",
+             mac[3], mac[4], mac[5]);
+    snprintf(s_cmd_topic, sizeof(s_cmd_topic), "zvuk/%s/cmd", s_device_id);
+    snprintf(s_state_topic, sizeof(s_state_topic), "zvuk/%s/state", s_device_id);
+
+    s_cmd_queue = xQueueCreate(4, MQTT_CMD_MAX);
+    xTaskCreate(mqtt_cmd_task, "mqtt_cmd", 8 * 1024, NULL, 4, NULL);
+
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = CONFIG_IOT_MQTT_URI,
+        .credentials = {
+            .client_id = s_device_id,
+            .username = CONFIG_IOT_MQTT_USERNAME,
+            .authentication.password = CONFIG_IOT_MQTT_PASSWORD,
+        },
+        .session.last_will = {
+            .topic = s_state_topic,
+            .msg = "{\"online\":false}",
+            .qos = 1,
+            .retain = 1,
+        },
+    };
+    s_mqtt_client = esp_mqtt_client_init(&cfg);
+    esp_mqtt_client_register_event(s_mqtt_client, ESP_EVENT_ANY_ID,
+                                   mqtt_event_handler, NULL);
+    esp_mqtt_client_start(s_mqtt_client);
+    ESP_LOGI(TAG, "MQTT: %s, подписка %s", CONFIG_IOT_MQTT_URI, s_cmd_topic);
 }
 
 void app_main(void)
@@ -505,5 +829,6 @@ void app_main(void)
         ESP_LOGI(TAG, "Подключаюсь к Wi-Fi \"%s\"...", CONFIG_IOT_WIFI_SSID);
     }
     xEventGroupWaitBits(s_wifi_events, WIFI_GOT_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    mqtt_start();
     ESP_LOGI(TAG, "Готово. Пример: curl -X POST --data-binary @sound.mp3 http://<IP>/play");
 }

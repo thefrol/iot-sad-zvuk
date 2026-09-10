@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IoT-колонки — управление</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --card: #1b1f28;
+    --border: #2a303c;
+    --text: #e6e9ef;
+    --muted: #8a93a5;
+    --accent: #4f8ef7;
+    --ok: #3fb97c;
+    --off: #e05656;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  main { padding: 24px; max-width: 860px; margin: 0 auto; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .device {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+  .device-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .device-id { font-weight: 600; font-size: 16px; font-family: ui-monospace, monospace; }
+  .badge {
+    font-size: 12px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .badge.online { color: var(--ok); border-color: var(--ok); }
+  .badge.offline { color: var(--off); border-color: var(--off); }
+  .badge.playing { color: var(--accent); border-color: var(--accent); }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button:disabled { opacity: .45; cursor: default; }
+  button:hover:not(:disabled) { filter: brightness(1.1); }
+  .vol { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 220px; }
+  .vol input[type=range] { flex: 1; accent-color: var(--accent); }
+  .vol .val { font-family: ui-monospace, monospace; font-size: 13px; color: var(--muted); width: 34px; text-align: right; }
+  .upload { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  input[type=file] {
+    color: var(--muted); font-size: 13px; max-width: 260px;
+  }
+  input[type=file]::file-selector-button {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; padding: 6px 12px; margin-right: 10px; cursor: pointer; font-size: 13px;
+  }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 18px; font-size: 14px; opacity: 0; transition: opacity .25s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { border-color: var(--off); color: var(--off); }
+</style>
+</head>
+<body>
+<header>
+  <h1>IoT-колонки</h1>
+  <div class="sub">Управление устройствами zvuk по MQTT</div>
+</header>
+<main id="app"><div class="empty">Загрузка…</div></main>
+<div class="toast" id="toast"></div>
+
+<script>
+const app = document.getElementById('app');
+const toast = document.getElementById('toast');
+let toastTimer = null;
+
+function showToast(msg, isErr) {
+  toast.textContent = msg;
+  toast.className = 'toast show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.className = 'toast', 3000);
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+
+async function sendCmd(id, cmd) {
+  try {
+    await api('/api/devices/' + encodeURIComponent(id) + '/cmd', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({cmd})
+    });
+    showToast('Команда отправлена: ' + cmd);
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+}
+
+async function uploadAndPlay(id, fileInput) {
+  const f = fileInput.files[0];
+  if (!f) { showToast('Выберите MP3-файл', true); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    const r = await api('/api/devices/' + encodeURIComponent(id) + '/play', {method: 'POST', body: fd});
+    showToast('Файл загружен, команда play отправлена');
+    fileInput.value = '';
+  } catch (e) {
+    showToast('Ошибка загрузки: ' + e.message, true);
+  }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function render(devices) {
+  if (!devices || devices.length === 0) {
+    app.innerHTML = '<div class="empty">Устройства не найдены. Они появятся здесь после первого сообщения состояния.</div>';
+    return;
+  }
+  // не перерисовываем, пока пользователь тянет слайдер или выбрал файл —
+  // иначе ввод сбросится на каждом опросе
+  const ae = document.activeElement;
+  if (ae && (ae.type === 'range' || ae.type === 'file')) return;
+  if ([...app.querySelectorAll('input[type=file]')].some(i => i.files.length)) return;
+  devices.sort((a, b) => a.id.localeCompare(b.id));
+  app.innerHTML = devices.map(d => `
+    <div class="device">
+      <div class="device-head">
+        <span class="device-id">${esc(d.id)}</span>
+        <span class="badge ${d.online ? 'online' : 'offline'}">${d.online ? 'онлайн' : 'оффлайн'}</span>
+        ${d.playing ? '<span class="badge playing">играет</span>' : ''}
+      </div>
+      <div class="meta">
+        IP: ${esc(d.ip || '—')} · громкость: ${d.volume} · активность: ${d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString('ru-RU') : '—'}
+      </div>
+      <div class="controls">
+        <div class="vol">
+          <input type="range" min="0" max="255" value="${d.volume}"
+                 ${d.online ? '' : 'disabled'}
+                 oninput="this.nextElementSibling.textContent = this.value"
+                 onchange="sendCmd('${esc(d.id)}', 'vol ' + this.value)">
+          <span class="val">${d.volume}</span>
+        </div>
+        <button class="secondary" ${d.online ? '' : 'disabled'} onclick="sendCmd('${esc(d.id)}', 'beep')">Пикнуть</button>
+        <button class="secondary" ${d.online ? '' : 'disabled'} onclick="sendCmd('${esc(d.id)}', 'stop')">Стоп</button>
+      </div>
+      <div class="upload">
+        <input type="file" accept="audio/mpeg,.mp3" id="file-${esc(d.id)}" ${d.online ? '' : 'disabled'}>
+        <button ${d.online ? '' : 'disabled'} onclick="uploadAndPlay('${esc(d.id)}', document.getElementById('file-${esc(d.id)}'))">Играть</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function poll() {
+  try {
+    render(await api('/api/devices'));
+  } catch (e) {
+    // молча повторим — сервер может перезапускаться
+  }
+}
+
+poll();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

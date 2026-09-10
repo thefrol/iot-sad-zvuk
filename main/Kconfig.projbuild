@@ -8,4 +8,16 @@ menu "iot-sad-zvuk"
         string "Wi-Fi пароль"
         default ""
 
+    config IOT_MQTT_URI
+        string "MQTT broker URI (пусто = MQTT выключен)"
+        default "mqtt://5.183.191.188:31883"
+
+    config IOT_MQTT_USERNAME
+        string "MQTT логин"
+        default "device"
+
+    config IOT_MQTT_PASSWORD
+        string "MQTT пароль"
+        default ""
+
 endmenu

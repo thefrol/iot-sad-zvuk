@@ -8,17 +8,17 @@
 
 - ESP32-C3, флеш **4 МБ** (подтверждено), PSRAM нет, SRAM 400 КБ.
 - Звук: I2S → MAX98357A, декодер Helix (целочисленный) — у C3 нет FPU.
-- Текущая прошивка ~846 КБ; Wi-Fi + TLS + MQTT доведут до ~1.3–1.5 МБ.
-- Стриминг: HTTP(S)-ответ читается чанками → ring-буфер ~32–64 КБ в RAM →
+- Прошивка ~1.6 МБ (Wi-Fi + HTTP + MQTT, без TLS); слот 1.94 МБ, запас ~17%.
+- Стриминг: HTTP(S)-ответ читается чанками → ring-буфер 32 КБ в RAM →
   `esp_audio_simple_dec` → I2S. Локальное хранилище не нужно.
 
 ## Архитектура (целевая)
 
 **Устройство:**
-- Wi-Fi station + `esp-mqtt` с TLS, топики:
-  `dev/{id}/cmd` (play URL / loop / volume / stop),
-  `dev/{id}/state` (статус + LWT «офлайн»),
-  `dev/{id}/ota` (URL новой прошивки).
+- Wi-Fi station + `esp-mqtt` (пока plain TCP, TLS к этапу 6), топики:
+  `zvuk/{id}/cmd` (beep / stop / `vol N` / `play <url>`),
+  `zvuk/{id}/state` (retained статус + LWT «офлайн»),
+  ota-топик добавить на этапе 5. `{id}` = `zvuk-XXXXXX` (3 байта MAC).
 - Плеер: HTTP(S)-стрим → декодер → I2S; зацикливание = повторный запрос
   по EOF.
 - OTA через `esp_https_ota` + откат
@@ -39,15 +39,18 @@
 2. ~~4 МБ в конфиге + локальное управление по HTTP~~ — готово
    (Wi-Fi station, esp_http_server: `POST /play` стримит тело запроса
    в декодер, `GET /beep`, `POST /stop`, `?vol=`).
-3. HTTP-стриминг **с сервера по URL** (устройство само ходит за аудио:
-   `POST /play?url=...` через esp_http_client). Прогон сначала с
-   локального сервера, потом по HTTPS.
-4. MQTT control-plane: play/stop/volume по командам с брокера,
-   публикация состояния.
+3. ~~HTTP-стриминг **с сервера по URL**~~ — готово (2026-09-09):
+   `POST /play?url=...` и MQTT-команда `play <url>` через `esp_http_client`,
+   стрим в тот же кольцевой буфер. Пока только plain HTTP, HTTPS — позже.
+4. ~~MQTT control-plane~~ — готово (2026-09-09): Mosquitto в кластере,
+   plain TCP (TLS — к этапу 6). Топики `zvuk/<id>/cmd` (beep / stop /
+   `vol N` / `play <url>`) и retained `zvuk/<id>/state` + LWT.
+   Device id: `zvuk-XXXXXX` (3 байта MAC). Прошивка ~1.6 МБ.
 5. OTA: таблица разделов с двумя слотами уже введена (`partitions.csv`),
    осталось добавить `esp_https_ota` + откат и LittleFS. После этого
    встроенный `sound.mp3` убрать — всё стримится.
-6. Бэкенд + фронтенд на k8s, привязка устройств, TLS/авторизация.
+6. Бэкенд + фронтенд на k8s, привязка устройств, TLS/авторизация
+   (MQTT пока на общем логине `device`, без TLS).
 
 ## Безопасность (к этапу 5–6)
 

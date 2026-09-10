@@ -2,8 +2,9 @@
 
 IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук через I2S-усилитель MAX98357A
 и 3W динамик. Устройство поднимает Wi-Fi station + HTTP-сервер и играет MP3,
-присланный в теле `POST /play` (стримится прямо в декодер, локально не хранится).
-Планы (MQTT, OTA, серверная часть) — в `ROADMAP.md`. Флеш 4 МБ.
+присланный в теле `POST /play` или лежащий по URL (стримится прямо в декодер,
+локально не хранится). Управление по MQTT (команды/статус). Дальше (TLS, OTA,
+серверная часть) — в `ROADMAP.md`. Флеш 4 МБ.
 
 ## Железо
 
@@ -50,11 +51,26 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
 - Файл `main/sound.mp3` (TTS-фраза, ~4 с, 44.1 кГц стерео 64 кбит/с) вшит во флеш
   через `EMBED_FILES` — играется по `GET /beep` для проверки железа
 - Wi-Fi station: SSID/пароль в Kconfig (`idf.py menuconfig` → iot-sad-zvuk,
-  `CONFIG_IOT_WIFI_SSID`/`CONFIG_IOT_WIFI_PASSWORD`)
+  `CONFIG_IOT_WIFI_SSID`/`CONFIG_IOT_WIFI_PASSWORD`; реальные значения лежат
+  только в локальном `sdkconfig` — он в .gitignore)
+- MQTT control-plane (managed-компонент `espressif/mqtt` — в IDF 6 из дерева
+  компонентов вынесен): Kconfig `CONFIG_IOT_MQTT_URI` / `_USERNAME` /
+  `_PASSWORD` (пустой URI = MQTT не стартует). Стартует после получения IP.
+  Device id = `zvuk-XXXXXX` (последние 3 байта MAC). Топики: подписка
+  `zvuk/<id>/cmd` (QoS 1), retained-стейт `zvuk/<id>/state`
+  (`{"online","id","ip","playing","volume"}`, LWT = `{"online":false}`).
+  Команды plain-text: `beep`, `stop`, `vol <0-255>`, `play <url>`;
+  неизвестные логируются и игнорируются. Команды исполняет задача `mqtt_cmd`
+  (8 КБ стека — внутри бывает esp_http_client), но `stop` обрабатывается
+  прямо в хендлере MQTT-событий, иначе не прервать воспроизведение, пока
+  задача занята.
 - HTTP API (`esp_http_server`):
   - `POST /play` — тело запроса это MP3-поток; хендлер кладёт данные в
     кольцевой буфер (32 КБ), декодирует отдельная задача `player` (16 КБ стека),
     перед стартом ждёт предбуфер 8 КБ; ответ приходит по окончании
+  - `POST /play?url=...` — устройство само забирает MP3 по HTTP
+    (`esp_http_client`) в тот же кольцевой буфер (общий каркас —
+    `stream_session_run`, источники: `httpd_body_read` / `http_url_read`)
   - `GET /beep` — встроенный звук один раз
   - `POST /stop` — остановить
   - `?vol=0..255` — громкость (параметр `/play` и `/beep`, дефолт 64)
@@ -98,6 +114,20 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
    `esp_wifi_set_ps(WIFI_PS_NONE)`. Ещё: синхронная цепочка recv→decode→I2S
    заикалась на слабом сигнале — поэтому сеть и декодер развязаны кольцевым
    буфером (StreamBuffer 32 КБ + предбуфер 8 КБ).
+8. **IDF 6: MQTT — managed-компонент.** В `~/esp/esp-idf/components/mqtt`
+   остались только test_apps; сам клиент подключается как `espressif/mqtt`
+   в `idf_component.yml` (примеры IDF пинуют `^1.0.0`), в CMake — `mqtt`
+   в PRIV_REQUIRES.
+9. **esp_http_server однопоточный.** Пока `play_handler` ждёт конца
+   воспроизведения, остальные HTTP-запросы (включая `POST /stop`!) стоят в
+   очереди — остановить HTTP-сессию по HTTP нельзя, только по MQTT (`stop`
+   там обрабатывается вне очереди команд). 409 по HTTP поймать почти
+   нереально: запросы сериализуются раньше мьютекса — мьютекс реально
+   защищает гонку HTTP vs MQTT.
+10. **Retained-стейт публикуем QoS 0, не QoS 1.** На плохом линке (RSSI
+    −86) QoS1-ретрансляции приходили на брокер с опозданием и затирали
+    retained-стейт устаревшим `playing:true` — свежая подписка видела
+    «играет» на молчащем устройстве.
 
 ## Сборка и прошивка
 
@@ -116,19 +146,22 @@ BCLK ~1.5–1.7V (меандр 1.4 МГц), LRC ~1.5–1.7V, DIN ~0.5–1.6V. Н
 ## Следующие шаги
 
 Полная дорожная карта — в `ROADMAP.md`. Ближайшее:
-- `POST /play?url=...` — устройство само забирает аудио по URL
-  (`esp_http_client`, стрим через тот же `esp_audio_simple_dec`)
-- MQTT control-plane (команды play/stop/volume, статусы), затем OTA
-  (своя `partitions.csv`: два слота + LittleFS), бэкенд/фронтенд на k8s
+- OTA (`esp_https_ota` + откат; `partitions.csv` с двумя слотами уже есть,
+  добавить LittleFS), после OTA встроенный `sound.mp3` убрать
+- TLS для MQTT (сейчас plain TCP — домашняя демка) и HTTPS для `play <url>`
+- Бэкенд/фронтенд на k8s (реестр устройств, раздача аудио)
 - Мут по сети: SD-пин усилителя можно посадить на GPIO
 
 ## Структура
 
-- `main/main.c` — вся прошивка: I2S init, Wi-Fi station, HTTP API, декодер
-- `main/Kconfig.projbuild` — Wi-Fi кредешелы (menuconfig → iot-sad-zvuk)
+- `main/main.c` — вся прошивка: I2S init, Wi-Fi station, HTTP API
+  (`/play` в т.ч. `?url=`), MQTT control-plane, декодер
+- `main/Kconfig.projbuild` — Wi-Fi кредешелы и MQTT URI/логин/пароль
+  (menuconfig → iot-sad-zvuk)
 - `main/sound.mp3` — встроенный звук для `/beep` (вшивается во флеш)
-- `main/idf_component.yml` — зависимость `espressif/esp_audio_codec`
-- `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.5 МБ с Wi-Fi не влезал
-  в дефолтный 1 МБ); места под LittleFS пока нет — добавить на этапе OTA
-- `ROADMAP.md` — целевая архитектура и план (MQTT, OTA, сервер)
+- `main/idf_component.yml` — зависимости `espressif/esp_audio_codec`,
+  `espressif/mqtt`
+- `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.6 МБ с Wi-Fi и MQTT);
+  места под LittleFS пока нет — добавить на этапе OTA
+- `ROADMAP.md` — целевая архитектура и план (TLS, OTA, сервер)
 - `managed_components/` — скачанные компоненты (в .gitignore)
