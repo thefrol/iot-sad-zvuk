@@ -47,7 +47,9 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
 - Звук: I2S Philips 16-bit stereo, 44100 Гц, новый драйвер `driver/i2s_std.h`
 - MP3-декодер: **Helix (целочисленный)** через managed-компонент
   `espressif/esp_audio_codec`, API `esp_audio_simple_dec` (сам парсит кадры —
-  скармливаем сырые данные кусками)
+  скармливаем сырые данные кусками). В Kconfig компонента выключены все
+  декодеры/энкодеры, кроме MP3 (`sdkconfig.defaults`): по умолчанию там
+  линкуются LC3/AMR/Opus/SBC/ALAC/... и прошивка тяжелеет на ~560 КБ
 - Файл `main/sound.mp3` (короткий бип: синус 880 Гц, 0.35 с с fade-in/out,
   44.1 кГц стерео 64 кбит/с) вшит во флеш через `EMBED_FILES` — играется
   по `GET /beep` для проверки железа
@@ -98,6 +100,8 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
   Креды для CI-сборки — GitHub Secrets: `WIFI_SSID`, `WIFI_PASSWORD`,
   `MQTT_URI`, `MQTT_USERNAME`, `MQTT_PASSWORD` (зашиваются в бинарь, без них
   устройство после OTA потеряет сеть/брокер).
+  **Полный цикл выпуска со всеми граблями — скилл
+  `.agents/skills/firmware-release`.**
 - Параллельное воспроизведение запрещено мьютексом (`409 Conflict`).
 - Оптимизация компилятора — `-O2` (`CONFIG_COMPILER_OPTIMIZATION_PERF`):
   на `-Og` декодер едва поспевает за реальным временем при активном Wi-Fi.
@@ -201,7 +205,10 @@ BCLK ~1.5–1.7V (меандр 1.4 МГц), LRC ~1.5–1.7V, DIN ~0.5–1.6V. Н
   `espressif/mqtt`, `espressif/cjson` (в IDF 6 cJSON вынесен из ядра)
 - `.github/workflows/release.yml` — CI: сборка прошивки по тегу `v*` и
   публикация GitHub Release с бинарником
-- `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.75 МБ с TLS и OTA,
-  запас ~13%); места под LittleFS пока нет
+- `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.19 МБ — MP3-only
+  кодек + TLS/OTA, запас ~41%); места под LittleFS теперь бы хватило,
+  но разметку не трогаем до этапа с LittleFS
+- `.agents/skills/firmware-release/` — скилл: цикл выпуска прошивки и OTA
+  (поднять VERSION → тег отдельным пушем → CI → проверка на устройстве)
 - `ROADMAP.md` — целевая архитектура и план (TLS, сервер)
 - `managed_components/` — скачанные компоненты (в .gitignore)
