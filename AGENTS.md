@@ -48,8 +48,9 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
 - MP3-декодер: **Helix (целочисленный)** через managed-компонент
   `espressif/esp_audio_codec`, API `esp_audio_simple_dec` (сам парсит кадры —
   скармливаем сырые данные кусками)
-- Файл `main/sound.mp3` (TTS-фраза, ~4 с, 44.1 кГц стерео 64 кбит/с) вшит во флеш
-  через `EMBED_FILES` — играется по `GET /beep` для проверки железа
+- Файл `main/sound.mp3` (короткий бип: синус 880 Гц, 0.35 с с fade-in/out,
+  44.1 кГц стерео 64 кбит/с) вшит во флеш через `EMBED_FILES` — играется
+  по `GET /beep` для проверки железа
 - Wi-Fi station: SSID/пароль в Kconfig (`idf.py menuconfig` → iot-sad-zvuk,
   `CONFIG_IOT_WIFI_SSID`/`CONFIG_IOT_WIFI_PASSWORD`; реальные значения лежат
   только в локальном `sdkconfig` — он в .gitignore)
@@ -101,7 +102,9 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
    аппаратный сброс (DTR=False обязательно, иначе плата уйдёт в download-режим
    и логов не будет).
 5. `say` + `ffmpeg` на macOS генерируют рабочий MP3:
-   `say -v Milena -o /tmp/zvuk.aiff "текст" && ffmpeg -i /tmp/zvuk.aiff -ar 44100 -ac 2 -b:a 64k main/sound.mp3`
+   `say -v Milena -o /tmp/zvuk.aiff "текст" && ffmpeg -i /tmp/zvuk.aiff -ar 44100 -ac 2 -b:a 64k main/sound.mp3`.
+   Текущий бип сделан чистым ffmpeg:
+   `ffmpeg -f lavfi -i "sine=frequency=880:duration=0.35" -af "afade=t=in:st=0:d=0.015,afade=t=out:st=0.20:d=0.15,volume=0.6" -ar 44100 -ac 2 -b:a 64k main/sound.mp3`
 6. **I2S крутит хвост.** Когда запись в DMA заканчивается, канал зацикливает
    последние данные — слышно «пек-пек-пек» (~185 мс при нашем буфере). Лечится
    заливкой нулей на весь DMA-буфер после воспроизведения (`i2s_flush_silence`).
