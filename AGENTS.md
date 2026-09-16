@@ -63,7 +63,9 @@ IoT-колонка на ESP32-C3: прошивка на ESP-IDF, звук чер
   `zvuk/<id>/cmd` (QoS 1), retained-стейт `zvuk/<id>/state`
   (`{"online","id","ip","playing","volume","fw"}`, LWT = `{"online":false}`).
   Команды plain-text: `beep`, `stop`, `vol <0-255>`, `play <url>`,
-  `ota` (проверить релиз и обновиться), `ota check` (только проверить);
+  `loop <url>` (играет по кругу, каждый круг URL запрашивается заново;
+  выход по `stop`), `ota` (проверить релиз и обновиться), `ota check`
+  (только проверить);
   неизвестные логируются и игнорируются. Команды исполняет задача `mqtt_cmd`
   (8 КБ стека — внутри бывает esp_http_client), но `stop` обрабатывается
   прямо в хендлере MQTT-событий, иначе не прервать воспроизведение, пока
@@ -188,13 +190,20 @@ BCLK ~1.5–1.7V (меандр 1.4 МГц), LRC ~1.5–1.7V, DIN ~0.5–1.6V. Н
 - TLS для MQTT (сейчас plain TCP — домашняя демка) и HTTPS для `play <url>`
 - LittleFS-раздел (запасной звук при потере сети), потом убрать встроенный
   `sound.mp3`
-- Бэкенд/фронтенд на k8s (реестр устройств, раздача аудио)
+- Довести сервер (этап 6 ROADMAP): привязка/имена устройств, TLS на MQTT,
+  авторизация; коллекции/плейлисты в галерее
 - Мут по сети: SD-пин усилителя можно посадить на GPIO
 
 ## Структура
 
 - `main/main.c` — вся прошивка: I2S init, Wi-Fi station, HTTP API
   (`/play` в т.ч. `?url=`, `/ota`), MQTT control-plane, декодер
+- `server/` — zvuk-server (Go): реестр устройств по MQTT-стейтам,
+  команды (`POST /api/devices/{id}/cmd`, `/play`), галерея звуков
+  (`GET/POST /api/audio`, `POST /api/audio/{name}/play` — тело
+  `{"device","loop"}`, `PATCH`/`DELETE /api/audio/{name}`; метаданные в
+  `tracks.json` рядом с mp3 в DATA_DIR), раздача mp3 `GET /audio/{name}`,
+  фронт из embed-статики (`static/index.html`, отдаётся на `/`)
 - `main/ota_update.c` — OTA: фоновая проверка GitHub Releases, скачивание
   через `esp_https_ota`, ручной триггер (`ota_update_check_now` /
   `ota_update_start_download`)

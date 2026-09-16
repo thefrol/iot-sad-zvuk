@@ -67,6 +67,31 @@
   .vol input[type=range] { flex: 1; accent-color: var(--accent); }
   .vol .val { font-family: ui-monospace, monospace; font-size: 13px; color: var(--muted); width: 34px; text-align: right; }
   .upload { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  .gallery {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin-bottom: 24px;
+  }
+  .gallery-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .gallery-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+  .loop-toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; cursor: pointer; }
+  .loop-toggle input { accent-color: var(--accent); }
+  .gallery-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 14px 0; }
+  select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 10px; font-size: 14px; font-family: ui-monospace, monospace;
+  }
+  .track {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 0; border-top: 1px solid var(--border);
+  }
+  .track-title { font-size: 14px; cursor: pointer; flex: 1; min-width: 140px; }
+  .track-title:hover { color: var(--accent); }
+  .track-meta { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
+  .track-actions { display: flex; gap: 8px; }
+  .track-actions button { padding: 6px 12px; font-size: 13px; }
   input[type=file] {
     color: var(--muted); font-size: 13px; max-width: 260px;
   }
@@ -89,7 +114,21 @@
   <h1>IoT-колонки</h1>
   <div class="sub">Управление устройствами zvuk по MQTT</div>
 </header>
-<main id="app"><div class="empty">Загрузка…</div></main>
+<main>
+  <section class="gallery">
+    <div class="gallery-head">
+      <h2>Галерея звуков</h2>
+      <label class="loop-toggle"><input type="checkbox" id="loop-toggle"> зациклить</label>
+    </div>
+    <div class="gallery-controls">
+      <select id="gallery-device"></select>
+      <input type="file" accept="audio/mpeg,.mp3" id="gallery-file">
+      <button onclick="uploadToGallery()">Загрузить</button>
+    </div>
+    <div id="tracks"><div class="empty">Загрузка…</div></div>
+  </section>
+  <div id="app"><div class="empty">Загрузка…</div></div>
+</main>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -133,6 +172,7 @@ async function uploadAndPlay(id, fileInput) {
     const r = await api('/api/devices/' + encodeURIComponent(id) + '/play', {method: 'POST', body: fd});
     showToast('Файл загружен, команда play отправлена');
     fileInput.value = '';
+    loadTracks();
   } catch (e) {
     showToast('Ошибка загрузки: ' + e.message, true);
   }
@@ -140,6 +180,112 @@ async function uploadAndPlay(id, fileInput) {
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// --- галерея ---
+
+let devicesCache = [];
+const tracksEl = document.getElementById('tracks');
+const deviceSel = document.getElementById('gallery-device');
+const loopToggle = document.getElementById('loop-toggle');
+
+function fmtSize(n) {
+  if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' МБ';
+  if (n >= 1024) return Math.round(n / 1024) + ' КБ';
+  return n + ' Б';
+}
+
+function renderTracks(tracks) {
+  if (!tracks || tracks.length === 0) {
+    tracksEl.innerHTML = '<div class="empty">Галерея пуста. Загрузите MP3 — он появится здесь.</div>';
+    return;
+  }
+  tracksEl.innerHTML = tracks.map(t => `
+    <div class="track">
+      <span class="track-title" title="Нажмите, чтобы переименовать"
+            onclick="renameTrack('${esc(t.name)}', ${JSON.stringify(t.title).replace(/"/g, '&quot;')})">${esc(t.title)}</span>
+      <span class="track-meta">${fmtSize(t.size)} · ${t.uploadedAt ? new Date(t.uploadedAt).toLocaleString('ru-RU') : '—'}</span>
+      <span class="track-actions">
+        <button onclick="playTrack('${esc(t.name)}')">Играть</button>
+        <button class="secondary" onclick="deleteTrack('${esc(t.name)}', ${JSON.stringify(t.title).replace(/"/g, '&quot;')})">Удалить</button>
+      </span>
+    </div>
+  `).join('');
+}
+
+function updateDeviceSelect() {
+  const online = devicesCache.filter(d => d.online);
+  const cur = deviceSel.value;
+  deviceSel.innerHTML = online.length
+    ? online.map(d => `<option value="${esc(d.id)}">${esc(d.id)}</option>`).join('')
+    : '<option value="">— нет онлайн-устройств —</option>';
+  if (online.some(d => d.id === cur)) deviceSel.value = cur;
+}
+
+async function loadTracks() {
+  try {
+    renderTracks(await api('/api/audio'));
+  } catch (e) {
+    // сервер может перезапускаться — повторим при следующем действии
+  }
+}
+
+async function playTrack(name) {
+  const device = deviceSel.value;
+  if (!device) { showToast('Нет онлайн-устройств', true); return; }
+  const loop = loopToggle.checked;
+  try {
+    await api('/api/audio/' + encodeURIComponent(name) + '/play', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({device, loop})
+    });
+    showToast(loop ? 'Запущено по кругу' : 'Играет');
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+}
+
+async function deleteTrack(name, title) {
+  if (!confirm('Удалить «' + title + '»?')) return;
+  try {
+    await api('/api/audio/' + encodeURIComponent(name), {method: 'DELETE'});
+    showToast('Трек удалён');
+    loadTracks();
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+}
+
+async function renameTrack(name, oldTitle) {
+  const title = prompt('Название трека', oldTitle);
+  if (!title || title === oldTitle) return;
+  try {
+    await api('/api/audio/' + encodeURIComponent(name), {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({title})
+    });
+    loadTracks();
+  } catch (e) {
+    showToast('Ошибка: ' + e.message, true);
+  }
+}
+
+async function uploadToGallery() {
+  const inp = document.getElementById('gallery-file');
+  const f = inp.files[0];
+  if (!f) { showToast('Выберите MP3-файл', true); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    await api('/api/audio', {method: 'POST', body: fd});
+    inp.value = '';
+    showToast('Загружено в галерею');
+    loadTracks();
+  } catch (e) {
+    showToast('Ошибка загрузки: ' + e.message, true);
+  }
 }
 
 function render(devices) {
@@ -184,13 +330,17 @@ function render(devices) {
 
 async function poll() {
   try {
-    render(await api('/api/devices'));
+    const devices = await api('/api/devices');
+    devicesCache = devices || [];
+    updateDeviceSelect();
+    render(devices);
   } catch (e) {
     // молча повторим — сервер может перезапускаться
   }
 }
 
 poll();
+loadTracks();
 setInterval(poll, 3000);
 </script>
 </body>

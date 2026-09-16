@@ -764,6 +764,33 @@ static void mqtt_handle_command(char *cmd)
         default:
             break;
         }
+    } else if (strncmp(cmd, "loop ", 5) == 0) {
+        // Играем по кругу: каждый круг URL запрашивается заново (между
+        // кругами короткая пауза). Выход — по `stop` или ошибке скачивания.
+        const char *url = cmd + 5;
+        while (*url == ' ') {
+            url++;
+        }
+        // флаг мог остаться поднятым от stop, нажатого «в холостую»
+        s_stop_requested = false;
+        while (!s_stop_requested) {
+            bool stopped = false;
+            switch (play_url(url, &stopped)) {
+            case PLAY_URL_BUSY:
+                ESP_LOGW(TAG, "loop: занято, уже играю");
+                stopped = true;
+                break;
+            case PLAY_URL_FETCH_ERR:
+                ESP_LOGW(TAG, "loop: не удалось скачать %s", url);
+                stopped = true;
+                break;
+            default:
+                break;
+            }
+            if (stopped) {
+                break;
+            }
+        }
     } else if (strcmp(cmd, "ota") == 0) {
         // Принудительно: проверить релиз и обновиться, если есть новее
         ota_update_check_now();

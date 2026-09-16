@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,10 +68,19 @@ type statePayload struct {
 	Volume  *int   `json:"volume"`
 }
 
+type Track struct {
+	Name       string    `json:"name"` // hex-имя файла, <name>.mp3
+	Title      string    `json:"title"`
+	Size       int64     `json:"size"`
+	UploadedAt time.Time `json:"uploadedAt"`
+}
+
 type Server struct {
 	mqtt      mqtt.Client
 	mu        sync.RWMutex
 	devices   map[string]*Device
+	tmu       sync.Mutex // галерея: tracks + tracks.json
+	tracks    map[string]*Track
 	dataDir   string
 	playBase  string // например http://zvuk.devdima.ru/audio
 	mqttReady chan struct{}
@@ -95,10 +105,12 @@ func main() {
 
 	s := &Server{
 		devices:   make(map[string]*Device),
+		tracks:    make(map[string]*Track),
 		dataDir:   dataDir,
 		playBase:  playBase,
 		mqttReady: make(chan struct{}),
 	}
+	s.loadTracks()
 
 	opts := mqtt.NewClientOptions().
 		AddBroker(mqttURL).
@@ -132,8 +144,13 @@ func main() {
 	mux.HandleFunc("GET /api/devices", s.handleListDevices)
 	mux.HandleFunc("POST /api/devices/{id}/cmd", s.handleCmd)
 	mux.HandleFunc("POST /api/devices/{id}/play", s.handlePlay)
+	mux.HandleFunc("GET /api/audio", s.handleListAudio)
+	mux.HandleFunc("POST /api/audio", s.handleUploadAudio)
+	mux.HandleFunc("POST /api/audio/{name}/play", s.handlePlayAudio)
+	mux.HandleFunc("PATCH /api/audio/{name}", s.handleRenameAudio)
+	mux.HandleFunc("DELETE /api/audio/{name}", s.handleDeleteAudio)
 	mux.HandleFunc("GET /audio/{name}", s.handleAudio)
-	mux.Handle("GET /", http.FileServerFS(staticFS))
+	mux.Handle("GET /", staticFiles())
 
 	httpSrv := &http.Server{
 		Addr:              listen,
@@ -256,18 +273,14 @@ func (s *Server) handleCmd(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if !deviceIDRe.MatchString(id) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "некорректный id устройства"})
-		return
-	}
-
+// storeUpload сохраняет multipart-файл (поле file) как <hex>.mp3 в dataDir
+// и регистрирует трек в галерее. При ошибке ответ уже отправлен, ok=false.
+func (s *Server) storeUpload(w http.ResponseWriter, r *http.Request) (t *Track, ok bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-	file, _, err := r.FormFile("file")
+	file, header, err := r.FormFile("file")
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "нужен multipart с полем file (макс 15 МБ)"})
-		return
+		return nil, false
 	}
 	defer file.Close()
 
@@ -276,22 +289,41 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "не удалось сохранить файл"})
-		return
+		return nil, false
 	}
-	if _, err := io.Copy(out, file); err != nil {
-		out.Close()
+	size, err := io.Copy(out, file)
+	out.Close()
+	if err != nil {
 		os.Remove(dst)
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "файл слишком большой"})
+		return nil, false
+	}
+
+	title := header.Filename
+	if title == "" {
+		title = name
+	}
+	return s.addTrack(name, title, size), true
+}
+
+func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !deviceIDRe.MatchString(id) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "некорректный id устройства"})
 		return
 	}
-	out.Close()
 
-	playURL := s.playBase + "/" + name
+	t, ok := s.storeUpload(w, r)
+	if !ok {
+		return
+	}
+
+	playURL := s.playBase + "/" + t.Name
 	if err := s.publishCmd(id, "play "+playURL); err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "mqtt: " + err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "url": playURL, "name": name})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "url": playURL, "name": t.Name, "title": t.Title})
 }
 
 func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
@@ -316,6 +348,191 @@ func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, f)
 }
 
+// --- галерея звуков ---
+
+// addTrack регистрирует трек и сохраняет tracks.json.
+func (s *Server) addTrack(name, title string, size int64) *Track {
+	t := &Track{Name: name, Title: title, Size: size, UploadedAt: time.Now()}
+	s.tmu.Lock()
+	s.tracks[name] = t
+	err := s.saveTracksLocked()
+	s.tmu.Unlock()
+	if err != nil {
+		log.Printf("галерея: не удалось сохранить tracks.json: %v", err)
+	}
+	return t
+}
+
+func (s *Server) tracksPath() string { return filepath.Join(s.dataDir, "tracks.json") }
+
+// saveTracksLocked пишет tracks.json атомарно (tmp + rename). Вызывать под s.tmu.
+func (s *Server) saveTracksLocked() error {
+	tmp := s.tracksPath() + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(f).Encode(s.tracks); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.tracksPath())
+}
+
+// loadTracks читает tracks.json и подхватывает mp3-файлы без метаданных
+// (например, залитые до появления галереи).
+func (s *Server) loadTracks() {
+	if data, err := os.ReadFile(s.tracksPath()); err == nil {
+		if err := json.Unmarshal(data, &s.tracks); err != nil {
+			log.Printf("галерея: битый tracks.json, игнорирую: %v", err)
+		}
+	}
+	entries, err := os.ReadDir(s.dataDir)
+	if err != nil {
+		log.Printf("галерея: не удалось прочитать %s: %v", s.dataDir, err)
+		return
+	}
+	changed := false
+	for _, e := range entries {
+		if e.IsDir() || !audioNameRe.MatchString(e.Name()) {
+			continue
+		}
+		if _, ok := s.tracks[e.Name()]; ok {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		s.tracks[e.Name()] = &Track{Name: e.Name(), Title: e.Name(),
+			Size: info.Size(), UploadedAt: info.ModTime()}
+		changed = true
+	}
+	if changed {
+		if err := s.saveTracksLocked(); err != nil {
+			log.Printf("галерея: не удалось сохранить tracks.json: %v", err)
+		}
+	}
+	log.Printf("галерея: %d треков в %s", len(s.tracks), s.dataDir)
+}
+
+func (s *Server) handleListAudio(w http.ResponseWriter, _ *http.Request) {
+	s.tmu.Lock()
+	list := make([]*Track, 0, len(s.tracks))
+	for _, t := range s.tracks {
+		cp := *t
+		list = append(list, &cp)
+	}
+	s.tmu.Unlock()
+	sort.Slice(list, func(i, j int) bool { return list[i].UploadedAt.After(list[j].UploadedAt) })
+	writeJSON(w, http.StatusOK, list)
+}
+
+// POST /api/audio — загрузка трека в галерею без воспроизведения.
+func (s *Server) handleUploadAudio(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.storeUpload(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+// POST /api/audio/{name}/play — проиграть трек из галереи на устройстве.
+// Тело: {"device":"zvuk-xxx","loop":false}.
+func (s *Server) handlePlayAudio(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !audioNameRe.MatchString(name) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	var body struct {
+		Device string `json:"device"`
+		Loop   bool   `json:"loop"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "невалидный JSON"})
+		return
+	}
+	if !deviceIDRe.MatchString(body.Device) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "некорректный id устройства"})
+		return
+	}
+	if _, err := os.Stat(filepath.Join(s.dataDir, name)); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "трек не найден"})
+		return
+	}
+	cmd := "play "
+	if body.Loop {
+		cmd = "loop "
+	}
+	playURL := s.playBase + "/" + name
+	if err := s.publishCmd(body.Device, cmd+playURL); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "mqtt: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "url": playURL})
+}
+
+// PATCH /api/audio/{name} — переименование трека: {"title":"..."}.
+func (s *Server) handleRenameAudio(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !audioNameRe.MatchString(name) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	var body struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "невалидный JSON"})
+		return
+	}
+	title := strings.TrimSpace(body.Title)
+	if title == "" || len(title) > 200 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title: 1-200 символов"})
+		return
+	}
+	s.tmu.Lock()
+	t, ok := s.tracks[name]
+	if ok {
+		t.Title = title
+		s.saveTracksLocked()
+	}
+	s.tmu.Unlock()
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "трек не найден"})
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+// DELETE /api/audio/{name} — удалить трек и файл.
+func (s *Server) handleDeleteAudio(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if !audioNameRe.MatchString(name) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	s.tmu.Lock()
+	_, ok := s.tracks[name]
+	if ok {
+		delete(s.tracks, name)
+		s.saveTracksLocked()
+	}
+	s.tmu.Unlock()
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "трек не найден"})
+		return
+	}
+	if err := os.Remove(filepath.Join(s.dataDir, name)); err != nil {
+		log.Printf("галерея: не удалось удалить %s: %v", name, err)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 // --- валидация команд ---
 
 func validateCmd(cmd string) error {
@@ -329,18 +546,19 @@ func validateCmd(cmd string) error {
 			return errors.New("vol: нужно целое 0-255")
 		}
 		return nil
-	case strings.HasPrefix(cmd, "play "):
-		raw := strings.TrimSpace(strings.TrimPrefix(cmd, "play "))
+	case strings.HasPrefix(cmd, "play "), strings.HasPrefix(cmd, "loop "):
+		verb := cmd[:strings.IndexByte(cmd, ' ')]
+		raw := strings.TrimSpace(cmd[len(verb)+1:])
 		u, err := url.Parse(raw)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return errors.New("play: нужен http(s) URL")
+			return errors.New(verb + ": нужен http(s) URL")
 		}
 		if strings.ContainsAny(raw, "\r\n") {
-			return errors.New("play: недопустимые символы в URL")
+			return errors.New(verb + ": недопустимые символы в URL")
 		}
 		return nil
 	default:
-		return errors.New("неизвестная команда; допустимы: beep, stop, vol N, play URL")
+		return errors.New("неизвестная команда; допустимы: beep, stop, vol N, play URL, loop URL")
 	}
 }
 
