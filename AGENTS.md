@@ -214,6 +214,10 @@ BCLK ~1.5–1.7V (меандр 1.4 МГц), LRC ~1.5–1.7V, DIN ~0.5–1.6V. Н
   `espressif/mqtt`, `espressif/cjson` (в IDF 6 cJSON вынесен из ядра)
 - `.github/workflows/release.yml` — CI: сборка прошивки по тегу `v*` и
   публикация GitHub Release с бинарником
+- `.github/workflows/server-image.yml` — CI/CD сервера: пуш в `main` с
+  изменениями в `server/` или тег `server-v*` → Docker-образ в GHCR
+  (`ghcr.io/<owner>/zvuk-server`, теги latest/sha/версия), оттуда его
+  забирает Kubernetes при деплое
 - `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.19 МБ — MP3-only
   кодек + TLS/OTA, запас ~41%); места под LittleFS теперь бы хватило,
   но разметку не трогаем до этапа с LittleFS
