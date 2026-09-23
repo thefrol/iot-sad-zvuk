@@ -1,0 +1,33 @@
+---
+# Backend + UI для IoT-колонок. ВНИМАНИЕ: ssl-redirect выключен намеренно —
+# ESP32 забирает /audio/*.mp3 по plain HTTP на 80 порту, редирект на https
+# его сломает. reg.ru имеет rate-limit на DNS-апдейты: применять ОДИН раз,
+# без apply/delete циклов.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zvuk-server
+  namespace: iot-sad-zvuk
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    external-dns.alpha.kubernetes.io/hostname: "zvuk.devdima.ru"
+    external-dns.alpha.kubernetes.io/target: "5.183.191.188"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"
+spec:
+  ingressClassName: public
+  tls:
+    - hosts:
+        - zvuk.devdima.ru
+      secretName: zvuk-devdima-ru-tls
+  rules:
+    - host: zvuk.devdima.ru
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: zvuk-server
+                port:
+                  number: 80

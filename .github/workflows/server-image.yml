@@ -1,16 +1,20 @@
-# Сборка Docker-образа zvuk-server и публикация в GitHub Container Registry.
-# Kubernetes потом забирает образ отсюда (imagePullSecrets, если пакет
-# приватный). Запуск:
-#   - пуш в main с изменениями в server/  → теги latest, main, sha-<короткий>
-#   - пуш тега server-v*                  → тег 0.1.0 (версия без префикса)
+# Сборка Docker-образа zvuk-server, публикация в GitHub Container Registry
+# и деплой в Kubernetes (namespace iot-sad-zvuk, манифесты в deploy/).
+# Запуск:
+#   - пуш в main с изменениями в server/ или deploy/ → теги latest, main,
+#     sha-<короткий>, затем apply + rollout restart
+#   - пуш тега server-v*                  → тег 0.1.0 (версия без префикса),
+#     под перекатывается на образ с этой версией
 #   - вручную из вкладки Actions
-# Секреты не нужны — образ публикуется через GITHUB_TOKEN (packages: write).
+# Секреты: KUBECONFIG_B64 — scoped kubeconfig (namespace-admin iot-sad-zvuk,
+# выдан `task new-client NAME=iot-sad-zvuk` в репе devdima-k8s). Для пуша
+# образа секреты не нужны — хватает GITHUB_TOKEN (packages: write).
 name: server-image
 
 on:
   push:
     branches: [main]
-    paths: ["server/**", ".github/workflows/server-image.yml"]
+    paths: ["server/**", "deploy/**", ".github/workflows/server-image.yml"]
     tags: ["server-v*"]
   workflow_dispatch:
 
@@ -51,3 +55,31 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Деплой в Kubernetes
+    needs: image
+    runs-on: ubuntu-latest
+    env:
+      KUBECONFIG: ${{ runner.temp }}/kubeconfig
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kubeconfig из секрета
+        run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$KUBECONFIG"
+
+      - name: Применить манифесты
+        run: kubectl apply -f deploy/
+
+      - name: Перекатить zvuk-server
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            # тег server-vX.Y.Z → образ с версией X.Y.Z (latest на тегах не публикуется)
+            kubectl set image deployment/zvuk-server \
+              zvuk-server=ghcr.io/${{ github.repository_owner }}/zvuk-server:${GITHUB_REF_NAME#server-v} \
+              -n iot-sad-zvuk
+          else
+            # :latest + imagePullPolicy: Always — restart подтянет свежий образ
+            kubectl rollout restart deployment/zvuk-server -n iot-sad-zvuk
+          fi
+          kubectl rollout status deployment/zvuk-server -n iot-sad-zvuk --timeout=180s

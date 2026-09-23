@@ -74,19 +74,18 @@
    Во фронте — чекбокс «зациклить» в галерее (шлёт `loop` вместо `play`).
    Между кругами короткая пауза (стрим запрашивается с нуля); бесшовный
    луп — позже через кеширование PCM.
-9. CI/CD — деплой по коммиту (GitHub Actions):
-   - `iot-sad-zvuk` (push в `server/`): docker build → push в registry
-     кластера (`5.183.191.188:32000`) → `kubectl apply` манифестов +
-     rollout restart. Реестр сейчас insecure (plain HTTP) — из GH Actions
-     надо либо поднять ingress/TLS на registry, либо пушить через SSH-туннель
-     на worker, либо переехать на GHCR + imagePullSecret.
-   - kubectl-доступ из CI: scoped kubeconfig через
-     `task new-client NAME=iot-sad-zvuk` в devdima-k8s (уже есть схема,
-     clients/), положить в GitHub Secrets как `KUBECONFIG_B64`.
-   - Манифесты живут в devdima-k8s → либо workflow там (тогда сборка
-     образа триггерится repository_dispatch'ем из iot-sad-zvuk), либо
-     перенести манифесты приложения в iot-sad-zvuk/deploy/ (broker и
-     инфра остаются в devdima-k8s). Решить на этапе реализации.
+9. ~~CI/CD — деплой по коммиту (GitHub Actions)~~ — готово (2026-09-23):
+   - Workflow `.github/workflows/server-image.yml`: пуш в `main` с
+     изменениями в `server/`/`deploy/` → docker build → push в GHCR
+     (`ghcr.io/thefrol/zvuk-server`, пакет публичный) →
+     `kubectl apply -f deploy/` + rollout restart. Тег `server-v*` → образ
+     с версией + `kubectl set image` на неё.
+   - kubectl-доступ из CI: scoped kubeconfig (namespace-admin
+     `iot-sad-zvuk`, выдан `task new-client NAME=iot-sad-zvuk` в
+     devdima-k8s) в GitHub Secrets как `KUBECONFIG_B64`.
+   - Манифесты приложения (mosquitto + zvuk-server) перенесены из
+     devdima-k8s в `deploy/` этого репо; в devdima-k8s остались только
+     RBAC/креды клиента (`clients/iot-sad-zvuk/`).
    - Сборка прошивки в CI — часть этапа 5 (OTA).
 
 ## Известные проблемы

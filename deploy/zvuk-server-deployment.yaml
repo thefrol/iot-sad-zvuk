@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zvuk-server
+  namespace: iot-sad-zvuk
+  labels:
+    app: zvuk-server
+spec:
+  replicas: 1
+  # RWO PVC (hostpath) — параллельный под на RollingUpdate не смонтируется
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: zvuk-server
+  template:
+    metadata:
+      labels:
+        app: zvuk-server
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: s37bfed61.fastvps-server.com
+      containers:
+        - name: zvuk-server
+          # Образ собирает CI в репе iot-sad-zvuk (.github/workflows/server-image.yml)
+          # и пушит в GHCR. Пакет публичный — imagePullSecret не нужен.
+          image: ghcr.io/thefrol/zvuk-server:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          # Secret zvuk-server-env создаётся императивно (не в git):
+          # MQTT_URL / MQTT_USER / MQTT_PASS
+          envFrom:
+            - secretRef:
+                name: zvuk-server-env
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /api/devices
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/devices
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: zvuk-server-data

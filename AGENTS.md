@@ -215,9 +215,16 @@ BCLK ~1.5–1.7V (меандр 1.4 МГц), LRC ~1.5–1.7V, DIN ~0.5–1.6V. Н
 - `.github/workflows/release.yml` — CI: сборка прошивки по тегу `v*` и
   публикация GitHub Release с бинарником
 - `.github/workflows/server-image.yml` — CI/CD сервера: пуш в `main` с
-  изменениями в `server/` или тег `server-v*` → Docker-образ в GHCR
-  (`ghcr.io/<owner>/zvuk-server`, теги latest/sha/версия), оттуда его
-  забирает Kubernetes при деплое
+  изменениями в `server/`/`deploy/` или тег `server-v*` → Docker-образ в
+  GHCR (`ghcr.io/<owner>/zvuk-server`, теги latest/sha/версия) → деплой в
+  Kubernetes: `kubectl apply -f deploy/` + rollout (на теге —
+  `kubectl set image` на версию). kubectl-доступ — секрет `KUBECONFIG_B64`
+  (scoped kubeconfig, namespace-admin `iot-sad-zvuk`; выдан
+  `task new-client NAME=iot-sad-zvuk` в репе devdima-k8s, локальная копия —
+  `~/Dimba/devdima-k8s/clients/iot-sad-zvuk/kubeconfig`)
+- `deploy/` — манифесты Kubernetes (namespace `iot-sad-zvuk`): mosquitto
+  (MQTT-брокер, NodePort 31883) и zvuk-server (deployment/service/ingress/
+  PVC). Переехали сюда из репо devdima-k8s 2026-09-23; применяются CI
 - `partitions.csv` — два OTA-слота по ~1.94 МБ (app ~1.19 МБ — MP3-only
   кодек + TLS/OTA, запас ~41%); места под LittleFS теперь бы хватило,
   но разметку не трогаем до этапа с LittleFS
