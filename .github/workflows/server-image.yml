@@ -60,13 +60,13 @@ jobs:
     name: Деплой в Kubernetes
     needs: image
     runs-on: ubuntu-latest
-    env:
-      KUBECONFIG: ${{ runner.temp }}/kubeconfig
     steps:
       - uses: actions/checkout@v4
 
       - name: Kubeconfig из секрета
-        run: echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$KUBECONFIG"
+        run: |
+          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
 
       - name: Применить манифесты
         run: kubectl apply -f deploy/
